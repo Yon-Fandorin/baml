@@ -26,10 +26,18 @@ struct ResponsesMessage {
 enum ResponsesContentPart {
     /// Text from a user or system message.
     #[serde(rename = "input_text")]
-    InputText { text: String },
+    InputText {
+        text: String,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
     /// Text from an assistant message.
     #[serde(rename = "output_text")]
-    OutputText { text: String },
+    OutputText {
+        text: String,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
     /// Image input.
     #[serde(rename = "input_image")]
     InputImage {
@@ -37,10 +45,17 @@ enum ResponsesContentPart {
         image_url: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
     /// Audio input.
     #[serde(rename = "input_audio")]
-    InputAudio { data: String, format: String },
+    InputAudio {
+        data: String,
+        format: String,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
     /// File input (PDF, etc.).
     #[serde(rename = "input_file")]
     InputFile {
@@ -50,6 +65,8 @@ enum ResponsesContentPart {
         filename: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_data: Option<String>,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
 }
 
@@ -122,11 +139,11 @@ fn responses_node_to_message(
             content,
             metadata,
         } => {
-            let parts = responses_content_parts(content.as_ref(), role)?;
-            let extra = match metadata {
-                serde_json::Value::Object(map) => map.clone(),
-                _ => serde_json::Map::new(),
-            };
+            let mut parts = responses_content_parts(content.as_ref(), role)?;
+            let mut extra = metadata_to_map(metadata);
+            if let Some(value) = extra.remove("prompt_cache_breakpoint") {
+                merge_metadata_into_last(&mut parts, "prompt_cache_breakpoint".to_string(), value);
+            }
 
             Ok(Some(ResponsesMessage {
                 role: role.clone(),
@@ -138,6 +155,32 @@ fn responses_node_to_message(
     }
 }
 
+fn metadata_to_map(metadata: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    match metadata {
+        serde_json::Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// Merge a content-level metadata field into the last content part.
+fn merge_metadata_into_last(
+    parts: &mut [ResponsesContentPart],
+    key: String,
+    value: serde_json::Value,
+) {
+    let Some(last) = parts.last_mut() else {
+        return;
+    };
+    let extra = match last {
+        ResponsesContentPart::InputText { extra, .. }
+        | ResponsesContentPart::OutputText { extra, .. }
+        | ResponsesContentPart::InputImage { extra, .. }
+        | ResponsesContentPart::InputAudio { extra, .. }
+        | ResponsesContentPart::InputFile { extra, .. } => extra,
+    };
+    extra.insert(key, value);
+}
+
 fn responses_content_parts(
     content: &PromptAstSimple,
     role: &str,
@@ -145,9 +188,15 @@ fn responses_content_parts(
     match content {
         PromptAstSimple::String(s) => {
             if role == "assistant" {
-                Ok(vec![ResponsesContentPart::OutputText { text: s.clone() }])
+                Ok(vec![ResponsesContentPart::OutputText {
+                    text: s.clone(),
+                    extra: serde_json::Map::new(),
+                }])
             } else {
-                Ok(vec![ResponsesContentPart::InputText { text: s.clone() }])
+                Ok(vec![ResponsesContentPart::InputText {
+                    text: s.clone(),
+                    extra: serde_json::Map::new(),
+                }])
             }
         }
         PromptAstSimple::Media(media) => {
@@ -183,12 +232,17 @@ fn responses_media_part(
             Ok(ResponsesContentPart::InputImage {
                 image_url: Some(url),
                 file_id: None,
+                extra: serde_json::Map::new(),
             })
         }),
         MediaKind::Audio => media.read_content(|c| {
             let data = content_to_base64(c)?;
             let format = audio_format_from_mime(&mime);
-            Ok(ResponsesContentPart::InputAudio { data, format })
+            Ok(ResponsesContentPart::InputAudio {
+                data,
+                format,
+                extra: serde_json::Map::new(),
+            })
         }),
         MediaKind::Pdf => media.read_content(|c| {
             let data_url = content_to_url_or_data_url(c, &mime)?;
@@ -196,6 +250,7 @@ fn responses_media_part(
                 file_id: None,
                 filename: None,
                 file_data: Some(data_url),
+                extra: serde_json::Map::new(),
             })
         }),
         MediaKind::Video => Err(crate::build_request::BuildRequestError::UnsupportedMedia(
@@ -274,6 +329,14 @@ mod tests {
             role: role.to_string(),
             content: Arc::new(PromptAstSimple::String(text.to_string())),
             metadata: serde_json::Value::Null,
+        })
+    }
+
+    fn msg_with_metadata(role: &str, text: &str, metadata: serde_json::Value) -> Arc<PromptAst> {
+        Arc::new(PromptAst::Message {
+            role: role.to_string(),
+            content: Arc::new(PromptAstSimple::String(text.to_string())),
+            metadata,
         })
     }
 
@@ -546,6 +609,32 @@ mod tests {
                 {"role": "user", "content": [{"type": "input_text", "text": "How are you?"}]},
                 {"role": "assistant", "content": [{"type": "output_text", "text": "I'm well."}]}
             ])
+        );
+    }
+
+    #[test]
+    fn responses_cache_breakpoint_merged_to_last_content_part() {
+        let prompt = msg_with_metadata(
+            "user",
+            "reusable prefix",
+            serde_json::json!({
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+                "provider_extension": true
+            }),
+        );
+        let messages = prompt_to_responses_input(&prompt).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&messages).unwrap(),
+            serde_json::json!([{
+                "role": "user",
+                "provider_extension": true,
+                "content": [{
+                    "type": "input_text",
+                    "text": "reusable prefix",
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }]
+            }])
         );
     }
 
